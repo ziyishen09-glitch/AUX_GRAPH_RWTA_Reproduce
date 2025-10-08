@@ -39,3 +39,10 @@ for QKD secured optical network
    and are static. Here, the network attribute s and d is abandoned,
    and changed to dynamic attribute attached to each request, so as 
    to stay in line with the paper(and the reality). 
+   modification to rwa.py and sim.py are conducted accordingly
+   there is a bug where the bp starts from 50% at even 1 erlang,
+   It is mysteriously fixed, I don't know why
+
+7. some modification are done to io module and an extra attribute
+   load_min and load_step is added in order to conduct experiment 
+   in specific load(traffic) range

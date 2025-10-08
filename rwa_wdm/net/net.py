@@ -7,6 +7,7 @@ __author__ = 'Cassio Batista'
 import logging
 from itertools import count
 from operator import itemgetter
+from random import randint
 from typing import Iterable, List, Tuple
 
 import numpy as np
@@ -279,7 +280,7 @@ class Network(object):
                     # original integer-based line (kept commented for reference):
                     # random_time = float(np.random.randint(0, 11))
                     # restore original behavior: small random decimal in [0,1)
-                    random_time = float(np.random.rand())
+                    random_time = randint(0, 10)
                 else:
                     random_time = 0.0
                 self._t[i][j][w] = random_time

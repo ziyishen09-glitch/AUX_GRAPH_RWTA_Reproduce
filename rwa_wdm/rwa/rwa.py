@@ -37,8 +37,8 @@ def dijkstra_vertex_coloring(net: Network, k: int, debug: bool = False) -> Union
         return Lightpath(route, wavelength)
     return None
 
-
-def dijkstra_first_fit(net: Network, k: int, debug: bool = False) -> Union[Lightpath, None]:
+#temporarily just modified this, because only this is used
+def dijkstra_first_fit(net: Network, s: int, d: int, k: int, debug: bool = False) -> Union[Lightpath, None]:
     """Dijkstra and first-fit combination as RWA algorithm
 
     Args:
@@ -50,7 +50,7 @@ def dijkstra_first_fit(net: Network, k: int, debug: bool = False) -> Union[Light
             lightpath
 
     """
-    route = dijkstra(net.a, net.s, net.d, debug=debug)
+    route = dijkstra(net.a, s, d, debug=debug)
     wavelength = first_fit(net, route)
     if wavelength is not None and wavelength < net.nchannels:
         return Lightpath(route, wavelength)

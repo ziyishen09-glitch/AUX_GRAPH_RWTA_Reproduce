@@ -12,7 +12,7 @@ class auxgraph_demo_net(Network):
         self._fullname = u'auxgraph_demo_net'
         # default source/destination for example runs (can be changed)
         self._s = 0
-        self._d = 3
+        self._d = 1
         super().__init__(ch_n,
                          len(self.get_nodes_2D_pos()),
                          len(self.get_edges()))

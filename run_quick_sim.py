@@ -18,14 +18,16 @@ DEFAULT_CONFIG = {
     'r': 'dijkstra',
     'w': 'first-fit',
     'rwa': None,
-    'load': 30,
-    'calls': 500,
+    'load': 250,
+    'load_min':30,
+    'load_step':20,
+    'calls': 10000,
     'result_dir': './results',
-    'num_sim': 1,
+    'num_sim': 10,
     'plot': True,
     'debug_adjacency':False,  #是否显示邻接矩阵
-    'debug_dijkstra':True, #是否显示dijkstra调试信息
-    'plot_topo':True
+    'debug_dijkstra':False, #是否显示dijkstra调试信息
+    'plot_topo':False
 }
 
 
@@ -44,6 +46,8 @@ def main(config: dict | None = None) -> int:
             rwa=cfg.get('rwa'),
             y=cfg.get('y'),
             load=cfg['load'],
+            load_min=cfg['load_min'],
+            load_step=cfg['load_step'],
             calls=cfg['calls'],
             result_dir=cfg['result_dir'],
             num_sim=cfg['num_sim'],

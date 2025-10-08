@@ -11,6 +11,7 @@ from argparse import Namespace
 
 
 import numpy as np
+import shutil
 
 # normal package-relative import (works when running as a module)
 from .io import write_bp_to_disk, write_it_to_disk, plot_bp
@@ -143,10 +144,12 @@ def simulator(args: Namespace) -> None:
         args: set of arguments provided via CLI to argparse module
 
     """
+    load_min = getattr(args, 'load_min', 1)
+    load_step = getattr(args, 'load_step', 1)
     debug_counter = 5 #dijkstra debug counter
     # print header for pretty stdout console logging
     print('Load:   ', end='')
-    for i in range(1, args.load + 1):
+    for i in range(load_min, args.load + 1, load_step):
         print('%4d' % i, end=' ')
     print()
 
@@ -198,19 +201,46 @@ def simulator(args: Namespace) -> None:
         blocklist = []
         blocks_per_erlang = []
 
-        # ascending loop through Erlangs
-        for load in range(1, args.load + 1):
+        # ascending loop through Erlangs (respect load_step)
+        for load in range(load_min, args.load + 1, load_step):
             blocks = 0
             for call in range(args.calls):
-                print('\rBlocks: ', end='', flush=True)
-                for b in blocklist:
-                    print('%04d ' % b, end='', flush=True)
-                print(' %04d' % call, end='')
+                # Print a single terminal-width-aware status line to avoid
+                # overflowing the console when blocklist grows large.
+                # Build the candidate string and truncate the left (older
+                # entries) if it doesn't fit in the terminal width.
+                prefix = 'Blocks: '
+                call_part = ' %04d' % call
+                # formatted entries are 5 chars each (e.g. '0001 ')
+                entries = ['%04d' % b for b in blocklist]
+                # compute terminal width (fallback to 80 cols)
+                term_w = shutil.get_terminal_size(fallback=(80, 20)).columns
+                # available space for entries (reserve prefix + call + 1)
+                avail = term_w - len(prefix) - len(call_part) - 1
+                if avail <= 0:
+                    # very narrow terminal: show minimal status
+                    out = f"{prefix}{call_part}"
+                else:
+                    # each entry printed with a trailing space
+                    per_len = 5
+                    max_entries = avail // per_len
+                    if max_entries >= len(entries):
+                        entries_str = ' '.join(entries) + ' '
+                        out = f"{prefix}{entries_str}{call_part}"
+                    else:
+                        # show ellipsis and the last `max_entries` entries
+                        shown = entries[-max_entries:] if max_entries > 0 else []
+                        entries_str = ' '.join(shown) + ' '
+                        out = f"{prefix}... {entries_str}{call_part}"
 
+                print('\r' + out, end='', flush=True)
+                #above is updated printing method for blocklist
+                
                 # discrete-slot sampling normalized to 250 Erlangs
                 # "暴力归一化": 当 load >= 250 时视为最稠密情况——每个时隙都有到达（scale=1）
                 # 否则按比例 scale = 250 / load 缩放 Exp(1) 连续采样并四舍五入到整数时隙
                 # 原始连续 Poisson/Exponential 采样（保留为注释，便于回溯）：
+                
                 # until_next = -np.log(1 - np.random.rand()) / load
                 # holding_time = -np.log(1 - np.random.rand())
 
@@ -227,24 +257,33 @@ def simulator(args: Namespace) -> None:
                 #holding_time_cont = -np.log(1.0 - np.random.rand())
 
                 # map to integer slots using scale; make sure at least 1 slot
+                
                 until_next = int(round(until_next_cont * scale))
+                
+                #until_next = 1000  #debug mode
+                
                 # holding_time = int(round(holding_time_cont * scale))
                 holding_time = 10 #not considering update, then holding time is fixed to 10
                 if until_next < 1:
                     until_next = 1
-                # Call RWA algorithm, which returns a lightpath if successful
-                # or None if no λ can be found available at the route's first
-                # link
-                # prefer passing debug flag when available
-                debug_dij=getattr(args, 'debug_dijkstra', False)
+                   
+                # choose a random (s,d) pair per request (s != d)
+                
+                n_nodes = net.a.shape[0]
+                a, b = np.random.choice(n_nodes, size=2, replace=False)
+                # enforce ordering so destination > source (duplex ordering)
+                #s, d = (int(a), int(b)) if a < b else (int(b), int(a))
+                s, d = int(a), int(b)
+                    
+                debug_dij = getattr(args, 'debug_dijkstra', False)
                 if debug_dij:
                     debug_counter -= 1
                     if debug_counter < 0:
-                        lightpath = rwa(net, args.y, debug=False)
+                        lightpath = rwa(net, s, d, args.y, debug=False)
                     else:
-                        lightpath = rwa(net, args.y, debug=debug_dij)
+                        lightpath = rwa(net, s, d, args.y, debug=debug_dij)
                 else:
-                    lightpath = rwa(net, args.y, debug=debug_dij)
+                    lightpath = rwa(net, s, d, args.y, debug=debug_dij)
 
                 # If lightpath is non None, the first link between the source
                 # node and one of its neighbours has a wavelength available,
@@ -255,6 +294,7 @@ def simulator(args: Namespace) -> None:
                 # other words, despite the RWA was successful at the first
                 # node, the connection can still be blocked on further links
                 # in the future hops to come, nevertheless.
+                
                 if lightpath is not None:
                     # check if the color chosen at the first link is available
                     # on all remaining links of the route
@@ -290,6 +330,8 @@ def simulator(args: Namespace) -> None:
                 # is the random initialisation of the traffic matrix's holding
                 # times during network object instantiation, but if this is
                 # indeed the fact it needs some consistent testing.
+                # iterate over a copy because we may remove items while iterating
+                
                 for lightpath in net.t.lightpaths:
                     if lightpath.holding_time > until_next:
                         lightpath.holding_time -= until_next
@@ -315,7 +357,7 @@ def simulator(args: Namespace) -> None:
 
                         # make matrices symmetric
                         net.t[j][i][w] = net.t[i][j][w]
-                        net.n[j][i][w] = net.n[j][i][w]
+                        net.n[j][i][w] = net.n[i][j][w]
 
             blocklist.append(blocks)
             blocks_per_erlang.append(100.0 * blocks / args.calls)
@@ -323,9 +365,20 @@ def simulator(args: Namespace) -> None:
         sim_time = default_timer() - sim_time
         time_per_simulation.append(sim_time)
 
-        print('\rBlocks: ', end='', flush=True)
-        for b in blocklist:
-            print('%04d ' % b, end='', flush=True)
+        # Print final blocklist but truncate if it's too wide
+        term_w = shutil.get_terminal_size(fallback=(80, 20)).columns
+        prefix = 'Blocks: '
+        entries = ['%04d' % b for b in blocklist]
+        per_len = 5
+        max_entries = max((term_w - len(prefix)) // per_len, 0)
+        if max_entries >= len(entries):
+            entries_str = ' '.join(entries) + ' '
+            print('\r' + prefix + entries_str, end='', flush=True)
+        else:
+            shown = entries[-max_entries:] if max_entries > 0 else []
+            entries_str = ' '.join(shown) + ' '
+            print('\r' + prefix + '... ' + entries_str, end='', flush=True)
+
         print('\n%-7s ' % 'BP (%):', end='')
         print(' '.join(['%4.1f' % b for b in blocks_per_erlang]), end=' ')
         print('[sim %d: %.2f secs]' % (simulation + 1, sim_time))
@@ -338,9 +391,9 @@ def simulator(args: Namespace) -> None:
         #     args.rwa if args.rwa is not None else '%s_%s' % (args.r, args.w),
         #     args.channels, args.calls, net.name)
 
-    write_bp_to_disk(args.result_dir, fbase + '.bp', blocks_per_erlang)
+        write_bp_to_disk(args.result_dir, fbase + '.bp', blocks_per_erlang)
 
-    write_it_to_disk(args.result_dir, fbase + '.it', time_per_simulation)
+        write_it_to_disk(args.result_dir, fbase + '.it', time_per_simulation)
 
     # cleanup dij logger handler if it was configured
     if dij_logger_handler is not None:
@@ -349,5 +402,7 @@ def simulator(args: Namespace) -> None:
         dij_logger_handler.close()
 
     if args.plot:
-        plot_bp(args.result_dir)
+        load_min = getattr(args, 'load_min', 1)
+        load_step = getattr(args, 'load_step', 1)
+        plot_bp(args.result_dir, load_min=load_min, load_max=args.load, load_step=load_step)
     
