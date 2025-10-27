@@ -39,68 +39,68 @@ def dijkstra(mat: np.ndarray, s: int, d: int, debug: bool = False) -> List[int]:
         G = nx.from_numpy_array(mat, create_using=nx.Graph())
         hops, path = nx.bidirectional_dijkstra(G, s, d, weight='weight')
         return path
+    else:
+        # Debug path: build the same NetworkX graph as the fast path and
+        # implement Dijkstra over that graph so debug uses identical input
+        # semantics (edge presence and 'weight' attribute).
+        G = nx.from_numpy_array(mat, create_using=nx.Graph())
+        n = G.number_of_nodes()
+        inf = math.inf
+        dist = [inf] * n
+        prev = [None] * n
+        visited = [False] * n
+        dist[s] = 0.0
 
-    # Debug path: build the same NetworkX graph as the fast path and
-    # implement Dijkstra over that graph so debug uses identical input
-    # semantics (edge presence and 'weight' attribute).
-    G = nx.from_numpy_array(mat, create_using=nx.Graph())
-    n = G.number_of_nodes()
-    inf = math.inf
-    dist = [inf] * n
-    prev = [None] * n
-    visited = [False] * n
-    dist[s] = 0.0
+        _dij_logger.debug('Dijkstra debug: from %s to %s, n=%d', s, d, n)
+        _dij_logger.debug('Initial dist: %s', dist)
 
-    _dij_logger.debug('Dijkstra debug: from %s to %s, n=%d', s, d, n)
-    _dij_logger.debug('Initial dist: %s', dist)
+        for _ in range(n):
+            # select the unvisited node with the smallest tentative distance
+            u = None
+            best = inf
+            for i in range(n):
+                if not visited[i] and dist[i] < best:
+                    best = dist[i]
+                    u = i
+            if u is None or dist[u] == inf:
+                _dij_logger.debug('No more reachable nodes, stopping.')
+                break
+            visited[u] = True
+            _dij_logger.debug('Select node %s with dist %s', u, dist[u])
+            if u == d:
+                _dij_logger.debug('Reached destination node.')
+                break
 
-    for _ in range(n):
-        # select the unvisited node with the smallest tentative distance
-        u = None
-        best = inf
-        for i in range(n):
-            if not visited[i] and dist[i] < best:
-                best = dist[i]
-                u = i
-        if u is None or dist[u] == inf:
-            _dij_logger.debug('No more reachable nodes, stopping.')
-            break
-        visited[u] = True
-        _dij_logger.debug('Select node %s with dist %s', u, dist[u])
-        if u == d:
-            _dij_logger.debug('Reached destination node.')
-            break
+            # relax edges from u using NetworkX adjacency (so attributes like
+            # 'weight' are respected exactly as in the fast path)
+            for v, data in G[u].items():
+                if visited[v]:
+                    continue
+                # read weight attribute; default to 1 if missing
+                w = data.get('weight', 1)
+                try:
+                    w = float(w)
+                except Exception:
+                    continue
+                # treat non-positive weight as no edge
+                if w <= 0:
+                    continue
+                alt = dist[u] + w
+                _dij_logger.debug('  examine edge %s->%s weight=%s, alt=%s, current dist[%s]=%s', u, v, w, alt, v, dist[v])
+                if alt < dist[v]:
+                    dist[v] = alt
+                    prev[v] = u
+                    _dij_logger.debug('    relax: dist[%s] -> %s, prev[%s] -> %s', v, alt, v, u)
 
-        # relax edges from u using NetworkX adjacency (so attributes like
-        # 'weight' are respected exactly as in the fast path)
-        for v, data in G[u].items():
-            if visited[v]:
-                continue
-            # read weight attribute; default to 1 if missing
-            w = data.get('weight', 1)
-            try:
-                w = float(w)
-            except Exception:
-                continue
-            # treat non-positive weight as no edge
-            if w <= 0:
-                continue
-            alt = dist[u] + w
-            _dij_logger.debug('  examine edge %s->%s weight=%s, alt=%s, current dist[%s]=%s', u, v, w, alt, v, dist[v])
-            if alt < dist[v]:
-                dist[v] = alt
-                prev[v] = u
-                _dij_logger.debug('    relax: dist[%s] -> %s, prev[%s] -> %s', v, alt, v, u)
-
-    # reconstruct path
-    if dist[d] == inf:
-        _dij_logger.debug('No path from %s to %s (unreachable).', s, d)
-        return []
-    path = []
-    cur = d
-    while cur is not None:
-        path.append(cur)
-        cur = prev[cur]
-    path.reverse()
-    _dij_logger.debug('Finished: shortest distance %s, path %s', dist[d], path)
-    return path
+        # reconstruct path
+        if dist[d] == inf:
+            _dij_logger.debug('No path from %s to %s (unreachable).', s, d)
+            return []
+        path = []
+        cur = d
+        while cur is not None:
+            path.append(cur)
+            cur = prev[cur]
+        path.reverse()
+        _dij_logger.debug('Finished: shortest distance %s, path %s', dist[d], path)
+        return path

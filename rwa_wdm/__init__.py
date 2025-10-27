@@ -5,7 +5,7 @@ optical networks.
 """
 import logging
 
-from .sim import simulator
+from .BASE_NO_UPD import simulator
 
 # https://stackoverflow.com/questions/15727420/using-logging-in-multiple-modules/15729700#15729700
 logging.basicConfig(

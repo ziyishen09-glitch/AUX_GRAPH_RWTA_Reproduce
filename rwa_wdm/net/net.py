@@ -46,10 +46,23 @@ class Lightpath(object):
     _ids = count(0)
 
     def __init__(self, route: List[int], wavelength: int):
+        # New optional flag `contains_virtual` is supported by RWA layer
+        # to indicate the returned route used one or more auxiliary hops.
         self._id: int = next(self._ids)
         self._route: List[int] = route
         self._wavelength: int = wavelength
         self._holding_time: float = 0.0
+        self._contains_virtual: bool = False
+        # optional container mapping virtual (aux) hops to the physical
+        # paths they represent. This mirrors the `contains_virtual` flag and
+        # can hold a list of physical path lists, e.g. [[p0,p1,...], ...]
+        # Set by RWA routines when an expanded/aux route was produced.
+        self._mapped_virtual_route: List[List[int]] | None = None
+        # optional per-link wavelength assignment: list with one entry per
+        # link in the route. When present, this takes precedence over the
+        # single-channel value stored in `_wavelength` for allocation and
+        # release operations.
+        self._w_list: List[int] | None = None
 
     @property
     def id(self) -> int:
@@ -79,6 +92,30 @@ class Lightpath(object):
         return self._wavelength
 
     @property
+    def w_list(self) -> List[int] | None:
+        """Optional per-link wavelength assignment.
+
+        When present, this is a list of integers where each element is the
+        wavelength index used on the corresponding link of the route. The
+        list length should match len(self.r) - 1 (number of links).
+        """
+        return getattr(self, '_w_list', None)
+
+    @w_list.setter
+    def w_list(self, val: List[int] | None) -> None:
+        if val is None:
+            self._w_list = None
+        else:
+            try:
+                self._w_list = [int(x) for x in val]
+            except Exception:
+                # fallback: wrap single int into list
+                try:
+                    self._w_list = [int(val)]
+                except Exception:
+                    self._w_list = None
+
+    @property
     def holding_time(self) -> float:
         """Time that the lightpath remains occupying net resources"""
         return self._holding_time
@@ -92,6 +129,39 @@ class Lightpath(object):
 
     def __str__(self):
         return '%s %d' % (self._route, self._wavelength)
+
+    @property
+    def contains_virtual(self) -> bool:
+        """Whether the lightpath route included auxiliary (virtual) hops."""
+        return getattr(self, '_contains_virtual', False)
+
+    @contains_virtual.setter
+    def contains_virtual(self, val: bool) -> None:
+        self._contains_virtual = bool(val)
+
+    @property
+    def mapped_virtual_route(self) -> List[List[int]] | None:
+        """If present, a container mapping the virtual hops used in the
+        route to their corresponding physical subpaths.
+
+        Structure: a list where each element is a list[int] describing a
+        physical path (sequence of node indices) that replaces one virtual
+        hop in the expanded route. May be None when no virtual hops were
+        present or when not set by the RWA layer.
+        """
+        return getattr(self, '_mapped_virtual_route', None)
+
+    @mapped_virtual_route.setter
+    def mapped_virtual_route(self, val: List[List[int]] | None) -> None:
+        if val is None:
+            self._mapped_virtual_route = None
+        else:
+            # coerce to list-of-lists for safety
+            try:
+                self._mapped_virtual_route = [list(p) for p in val]
+            except Exception:
+                # fallback: wrap single route in a list
+                self._mapped_virtual_route = [list(val)]
 
 
 class AdjacencyMatrix(np.ndarray):
@@ -161,8 +231,8 @@ class TrafficMatrix(np.ndarray):
         obj = np.asarray(arr, dtype=np.float32).view(cls)
 
         # set extra parameters
-        obj._usage: np.ndarray = np.zeros(num_ch, dtype=np.uint16)
-        obj._lightpaths: List[Lightpath] = []
+        obj._usage = np.zeros(num_ch, dtype=np.uint16)
+        obj._lightpaths = []
 
         return obj
 
@@ -244,7 +314,10 @@ class Network(object):
                 self._n[i][j][w] = availability
                 self._n[j][i][w] = self._n[i][j][w] #for symmetry
 
-        # fill in adjacency matrix (support optional weight as third element)
+        # fill in adjacency matrix using only physical edges (get_edges()).
+        # Auxiliary edges must not populate the base adjacency/availability
+        # structures during initialization; they are used only for routing
+        # augmentation at runtime.
         for edge in self.get_edges():
             if len(edge) == 2:
                 i, j = edge
@@ -258,7 +331,7 @@ class Network(object):
                 # fallback: if weight is not directly assignable, coerce to 1
                 self._a[i][j] = 1
             self._a[j][i] = self._a[i][j]
-
+                
         # fill in traffic matrix
         # FIXME when updating the traffic matrix via holding time parameter,
         # these random time attributions may seem not the very smart ones,
@@ -276,13 +349,9 @@ class Network(object):
                 # allocations are spread over the first 10 slots. When the
                 # wavelength is free, time is 0.
                 if self._n[i][j][w]:
-                    # previously initialized with integer remaining times in [0,10]
-                    # original integer-based line (kept commented for reference):
-                    # random_time = float(np.random.randint(0, 11))
-                    # restore original behavior: small random decimal in [0,1)
-                    random_time = randint(0, 10)
+                    random_time = np.random.randint(1, 11)
                 else:
-                    random_time = 0.0
+                    random_time = 0
                 self._t[i][j][w] = random_time
                 self._t[j][i][w] = self._t[i][j][w]
 
@@ -352,7 +421,13 @@ class Network(object):
 
         # define vertices or nodes as points in 2D cartesian plan
         # define links or edges as node index ordered pairs in cartesian plan
-        links = self.get_edges()
+        try:
+            links = self.get_edges()
+            aux_links = self.get_aux_edges()
+        except Exception:
+            links = self.get_edges()
+            aux_links = []
+            
         nodes = self.get_nodes_2D_pos()
         node_coords = list(nodes.values())  # get only 2D coordinates
 
@@ -371,7 +446,7 @@ class Network(object):
                     weight = 1
             x = (node_coords[i][0], node_coords[j][0])
             y = (node_coords[i][1], node_coords[j][1])
-            ax.plot(x, y, 'k', lw=2)
+            ax.plot(x, y, lw=2, color='black')
             # annotate weight at edge midpoint(with a small offset)
             try:
                 mx = (node_coords[i][0] + node_coords[j][0]) / 2.0 +0.08
@@ -379,7 +454,65 @@ class Network(object):
                 ax.annotate(str(int(weight)) if weight == int(weight) else str(weight), xy=(mx, my), xytext=(0, 0), textcoords='offset points', ha='center', va='center', fontsize=12, color='green')
             except Exception:
                 pass
+            
+        # draw auxiliary links as curved segments so they don't overlap
+        # physical straight edges and are visually distinct.
+        from matplotlib.path import Path
+        from matplotlib.patches import PathPatch
 
+        for idx, aux_edge in enumerate(aux_links):
+            # support edge formats (i,j) or (i,j,weight)
+            if len(aux_edge) == 2:
+                i, j = aux_edge
+                weight = 1
+            else:
+                i, j = aux_edge[0], aux_edge[1]
+                # third element is treated as weight (numeric)
+                try:
+                    weight = float(aux_edge[2])
+                except Exception:
+                    weight = 1
+
+            x0, y0 = node_coords[i][0], node_coords[i][1]
+            x1, y1 = node_coords[j][0], node_coords[j][1]
+
+            # compute a perpendicular offset for the control point
+            dx = x1 - x0
+            dy = y1 - y0
+            # normalized perpendicular vector
+            perp_x, perp_y = -dy, dx
+            norm = (perp_x ** 2 + perp_y ** 2) ** 0.5
+            if norm != 0:
+                perp_x /= norm
+                perp_y /= norm
+
+            # alternating curve direction based on index to avoid overlap
+            direction = 1 if (idx % 2 == 0) else -1
+
+            # curvature amplitude: scale with node distance
+            dist = ((dx ** 2) + (dy ** 2)) ** 0.5
+            amp = max(0.15 * dist, 0.2)
+
+            # control point for quadratic Bezier (midpoint displaced by perp)
+            cx = (x0 + x1) / 2.0 + direction * perp_x * amp
+            cy = (y0 + y1) / 2.0 + direction * perp_y * amp
+
+            # construct a quadratic Bezier path (CURVE3 segments)
+            verts = [(x0, y0), (cx, cy), (x1, y1)]
+            codes = [Path.MOVETO, Path.CURVE3, Path.CURVE3]
+            path = Path(verts, codes)
+            patch = PathPatch(path, facecolor='none', edgecolor='blue', lw=2)
+            ax.add_patch(patch)
+
+            # annotate weight at curve midpoint (use param t=0.5 on quadratic bezier)
+            try:
+                # quadratic Bezier midpoint formula for t=0.5
+                t = 0.5
+                mx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
+                my = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
+                ax.annotate(str(int(weight)) if weight == int(weight) else str(weight), xy=(mx, my), xytext=(0, 0), textcoords='offset points', ha='center', va='center', fontsize=12, color='green')
+            except Exception:
+                pass
         # highlight in red the shortest path with wavelength(s) available
         # a.k.a. 'best route'
         if bestroute is not None:

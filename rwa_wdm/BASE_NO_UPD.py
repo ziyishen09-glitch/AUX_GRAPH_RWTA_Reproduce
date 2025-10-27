@@ -12,6 +12,7 @@ from argparse import Namespace
 
 import numpy as np
 import shutil
+import heapq
 
 # normal package-relative import (works when running as a module)
 from .io import write_bp_to_disk, write_it_to_disk, plot_bp
@@ -147,6 +148,7 @@ def simulator(args: Namespace) -> None:
     load_min = getattr(args, 'load_min', 1)
     load_step = getattr(args, 'load_step', 1)
     debug_counter = 5 #dijkstra debug counter
+    aux_graph_mode = False
     # print header for pretty stdout console logging
     print('Load:   ', end='')
     for i in range(load_min, args.load + 1, load_step):
@@ -200,7 +202,15 @@ def simulator(args: Namespace) -> None:
         )
         blocklist = []
         blocks_per_erlang = []
-
+        
+        # Use a min-heap to schedule data-layer updates. We store
+        # tuples as (arrival_time_remaining, call_id, is_satisfied) so the
+        # heap is ordered by arrival_time_remaining (smallest arrival on top).
+        # arrival_time_remaining is an absolute slot index (remaining time
+        # measured from now) depending on how the simulator tracks
+        # time; later code should push using heapq.heappush.
+        update_recorder: list[tuple[int, int, bool]] = []
+        
         # ascending loop through Erlangs (respect load_step)
         for load in range(load_min, args.load + 1, load_step):
             blocks = 0
@@ -243,29 +253,28 @@ def simulator(args: Namespace) -> None:
                 
                 # until_next = -np.log(1 - np.random.rand()) / load
                 # holding_time = -np.log(1 - np.random.rand())
-
-                if load >= 250:
-                    scale = 1.0
-                else:
-                    # load is at least 1 in loop; guard for safety
-                    scale = 250.0 / float(load) if load != 0 else 250.0
-
-                # draw exponential(1) continuous samples via inverse-transform
-                # (keeps the original implementation style and is numerically
-                # identical to np.random.exponential(1.0))
-                until_next_cont = -np.log(1.0 - np.random.rand())
-                #holding_time_cont = -np.log(1.0 - np.random.rand())
-
-                # map to integer slots using scale; make sure at least 1 slot
                 
-                until_next = int(round(until_next_cont * scale))
+                
+                lam = float(load) / 250.0
+                if lam > 1.0:
+                    lam = 1.0
+
+                # draw an exponential interarrival with rate `lam`
+                # using numpy's helper (scale = 1/lambda)
+                until_next_cont = np.random.exponential(scale=1.0 / lam)
+                until_next = int(np.floor(until_next_cont))
                 
                 #until_next = 1000  #debug mode
                 
-                # holding_time = int(round(holding_time_cont * scale))
+                
+                
                 holding_time = 10 #not considering update, then holding time is fixed to 10
-                if until_next < 1:
-                    until_next = 1
+                
+                # 去掉这个条件就可以使一个时隙存在多个到达
+                # 原代码的逻辑是按每个call来rwta，即事件驱动
+                # 并没有不允许同一时隙存在多个到达的情况
+                # if until_next < 1:
+                #     until_next = 1
                    
                 # choose a random (s,d) pair per request (s != d)
                 
@@ -279,11 +288,11 @@ def simulator(args: Namespace) -> None:
                 if debug_dij:
                     debug_counter -= 1
                     if debug_counter < 0:
-                        lightpath = rwa(net, s, d, args.y, debug=False)
+                        lightpath = rwa(net, s, d, args.y, debug=False, aux_graph_mode=aux_graph_mode)
                     else:
-                        lightpath = rwa(net, s, d, args.y, debug=debug_dij)
+                        lightpath = rwa(net, s, d, args.y, debug=debug_dij, aux_graph_mode=aux_graph_mode)
                 else:
-                    lightpath = rwa(net, s, d, args.y, debug=debug_dij)
+                    lightpath = rwa(net, s, d, args.y, debug=debug_dij, aux_graph_mode=aux_graph_mode)
 
                 # If lightpath is non None, the first link between the source
                 # node and one of its neighbours has a wavelength available,
@@ -298,10 +307,22 @@ def simulator(args: Namespace) -> None:
                 if lightpath is not None:
                     # check if the color chosen at the first link is available
                     # on all remaining links of the route
-                    for (i, j) in lightpath.links:
-                        if not net.n[i][j][lightpath.w]:
-                            lightpath = None
-                            break
+                    links_list = list(lightpath.links)
+                    # if per-link assignments exist, check each link's wavelength
+                    if hasattr(lightpath, 'w_list') and lightpath.w_list:
+                        for idx, (i, j) in enumerate(links_list):
+                            try:
+                                w = lightpath.w_list[idx]
+                            except Exception:
+                                w = getattr(lightpath, 'w', None)
+                            if w is None or not net.n[i][j][w]:
+                                lightpath = None
+                                break
+                    else:
+                        for (i, j) in links_list:
+                            if not net.n[i][j][lightpath.w]:
+                                lightpath = None
+                                break
 
                 # Check if λ was not available either at the first link from
                 # the source or at any other further link along the route.
@@ -312,13 +333,30 @@ def simulator(args: Namespace) -> None:
                 else:
                     lightpath.holding_time = holding_time
                     net.t.add_lightpath(lightpath)
-                    for (i, j) in lightpath.links:
-                        net.n[i][j][lightpath.w] = 0  # lock channel
-                        net.t[i][j][lightpath.w] = holding_time
-
-                        # make it symmetric
-                        net.n[j][i][lightpath.w] = net.n[i][j][lightpath.w]
-                        net.t[j][i][lightpath.w] = net.t[i][j][lightpath.w]
+                    # allocate per-link wavelengths when available
+                    if hasattr(lightpath, 'w_list') and lightpath.w_list:
+                        for idx, (i, j) in enumerate(links_list):
+                            try:
+                                w = lightpath.w_list[idx]
+                            except Exception:
+                                w = getattr(lightpath, 'w', None)
+                            if w is None:
+                                continue
+                            net.n[i][j][w] = 0  # lock channel
+                            net.t[i][j][w] = holding_time
+                            # make it symmetric
+                            net.n[j][i][w] = net.n[i][j][w]
+                            net.t[j][i][w] = net.t[i][j][w]
+                    else:
+                        for (i, j) in links_list:
+                            w = getattr(lightpath, 'w', None)
+                            if w is None:
+                                continue
+                            net.n[i][j][w] = 0  # lock channel
+                            net.t[i][j][w] = holding_time
+                            # make it symmetric
+                            net.n[j][i][w] = net.n[i][j][w]
+                            net.t[j][i][w] = net.t[i][j][w]
 
                 # FIXME The following two routines below are part of the same
                 # one: decreasing the time network resources remain allocated
@@ -382,7 +420,7 @@ def simulator(args: Namespace) -> None:
         print('\n%-7s ' % 'BP (%):', end='')
         print(' '.join(['%4.1f' % b for b in blocks_per_erlang]), end=' ')
         print('[sim %d: %.2f secs]' % (simulation + 1, sim_time))
-        fbase = '%s_%dch' % (
+        fbase = 'BASE_%s_%dch' % (
             args.rwa if args.rwa is not None else '%s_%s' % (args.r, args.w),
             int(args.channels))
 
