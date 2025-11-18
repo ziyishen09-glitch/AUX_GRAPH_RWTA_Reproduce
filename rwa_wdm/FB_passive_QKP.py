@@ -68,9 +68,6 @@ def get_net_instance_from_args(topname: str, numch: int) -> Network:
     elif topname == 'auxgraph_aux_d2':
         from .net import auxgraph_aux_d2
         return auxgraph_aux_d2(numch)
-    elif topname == 'auxgraph_aux_d1':
-        from .net import auxgraph_aux_d1
-        return auxgraph_aux_d1(numch)
     else:
         raise ValueError('No network named "%s"' % topname)
 
@@ -333,6 +330,7 @@ def simulator(args: Namespace) -> None:
                         raise RuntimeError(msg)
                     else:
                         logger.warning(msg)
+                # priority: ensure requests are popped before updates at the same ev_time
                 prio = 0 if ev_type == 'request' else 1
                 heapq.heappush(event_queue, (ev_time, prio, ev_type, ev_call, ev_last))
 
@@ -350,7 +348,20 @@ def simulator(args: Namespace) -> None:
 
             # helper to sample interarrival given load
             def sample_interarrival(load_val):
+                # New (preferred): discrete-time Poisson arrivals → geometric interarrival (support starts at 1)
+                # per-slot arrival rate: lambda_arr = load / E[S] where E[S]=250 slots (geometric service mean)
                 
+                # lambda_arr = float(load_val) / 280.0
+                # # # convert to geometric success probability p = 1 - exp(-lambda_arr)
+                # # # guard for extreme values to avoid p<=0 or p>=1 due to float issues
+                # p = 1.0 - np.exp(-lambda_arr)
+                # if p <= 0.0:
+                #     p = 1e-12
+                # elif p >= 1.0:
+                #     p = 1.0 - 1e-12
+                # return int(np.random.geometric(p))  # returns 1,2,3,... (slots until next arrival)
+
+                # Old (kept for comparison): continuous exponential + ceil to slots
                 lam = float(load_val) / 250.0
                 if lam > 1.0:
                     lam = 1.0
@@ -508,53 +519,41 @@ def simulator(args: Namespace) -> None:
                 else:
                     # allocate resources and set holding time
                     holding_time = 10
-                    counter_links, total_resource, used_resource, used_resource_single, load_corrector, SR, n_links = 0, 0, 0, False, False, 0.0, 0
-                    # calculate SR, if above 0.5 degrade to physical graph for alloc
-                    # lightpath.links may be a generator — materialize once for reuse
-                    links_list = list(lightpath.links)
-                    n_links = len(links_list)
-                    # defensive guard: if path has no links, treat SR as 0.0
-                    if n_links <= 0:
-                        total_resource = 0
-                        SR = 0.0
-                    # else:
-                    #     total_resource = n_links * net.nchannels
-                    #     for (i, j) in links_list:
-                    #         per_link_used = sum(1 for w in range(net.nchannels) if not net.n[i][j][w])
-                    #         used_resource += per_link_used
-                    #         # if any single link has >= 50% channels used, mark local congestion
-                    #         # notice that this allocated one also counts, so equation should minus 1
-                    #         if per_link_used >= (net.nchannels / 2 - 1):
-                    #             used_resource_single = True
-                    #     SR = used_resource / total_resource if total_resource > 0 else 0.0
-                    # if SR >= 0.5 or used_resource_single:
-                    # # allocate process
-                    #     alloc_time = holding_time
-                    # else:
                     if lightpath.contains_virtual:
-                        for vr in lightpath.mapped_virtual_route:
-                            for (i, j) in list(zip(vr, vr[1:])):
-                                per_link_used = sum(1 for w in range(net.nchannels) if not net.n[i][j][w]) + 1
-                                # if any single link has >= 50% channels used, mark local congestion
-                                # notice that this allocated one also counts, so equation should minus 1
-                                used_resource += per_link_used
-                                counter_links += 1
-                                if per_link_used > (net.nchannels / 2):
-                                    used_resource_single = True
-                            SR = used_resource / (counter_links * net.nchannels)
                         if lightpath_debug and debug_counter_2 > 0:
                             debug_counter_2 -= 1
                             print('RWA allocated a lightpath containing virtual hops:', lightpath)
-                        if SR > 0.5:
-                            alloc_time = holding_time
-                        else:
-                            alloc_time = holding_time * 1.5
+                        alloc_time = holding_time * 1.5
                     else:
                         alloc_time = holding_time
-                            
+                        
                     lightpath.holding_time = alloc_time
                     net.t.add_lightpath(lightpath)
+                    # If the allocated lightpath used auxiliary (virtual)
+                    # hops, deposit QKP keys into the pools corresponding
+                    # to the latter half of each mapped physical subpath.
+                    try:
+                        if getattr(lightpath, 'contains_virtual', False) and getattr(lightpath, 'mapped_virtual_route', None):
+                            amount = holding_time  # keys proportional to data-layer holding time
+                            for phys in lightpath.mapped_virtual_route:
+                                if not phys or len(phys) < 2:
+                                    continue
+                                split = len(phys) // 2
+                                for i in range(split, len(phys) - 1):
+                                    edge = (phys[i], phys[i + 1])
+                                    try:
+                                        net.record_bypass_saved_keys(edge, amount)
+                                    except Exception:
+                                        # ignore if QKP API not supported or other errors
+                                        pass
+                    except Exception:
+                        # defensive: do not let QKP bookkeeping break simulator
+                        pass
                     # accumulate resource usage: holding_time * number_of_links
+                    links_list = list(lightpath.links)
+                    n_links = len(links_list) if links_list is not None else 0
+                    if n_links <= 0:
+                        n_links = 1
                     resource_used_time += alloc_time * n_links
                     # support per-link wavelength assignments (w_list)
                     if hasattr(lightpath, 'w_list') and lightpath.w_list:
@@ -565,6 +564,20 @@ def simulator(args: Namespace) -> None:
                                 w = getattr(lightpath, 'w', None)
                                 if w is None:
                                     continue
+                            # if w is negative (sentinel), this link was satisfied
+                            # by QKP and does not consume a wavelength channel
+                            try:
+                                if isinstance(w, int) and w < 0:
+                                    # This link was satisfied by QKP; record the
+                                    # committed consumption here (simulator-level)
+                                    try:
+                                        net.record_qkp_consumption((i, j), 10,
+                                                                   {'route': tuple(lightpath.r), 'sim': simulation + 1, 'time': current_time})
+                                    except Exception:
+                                        pass
+                                    continue
+                            except Exception:
+                                pass
                             net.n[i][j][w] = 0  # lock channel
                             net.t[i][j][w] = alloc_time
                             net.n[j][i][w] = net.n[i][j][w]
@@ -574,6 +587,18 @@ def simulator(args: Namespace) -> None:
                             w = getattr(lightpath, 'w', None)
                             if w is None:
                                 continue
+                            # if the uniform wavelength is negative (shouldn't
+                            # normally happen) skip locking
+                            try:
+                                if isinstance(w, int) and w < 0:
+                                    try:
+                                        net.record_qkp_consumption((i, j), 10,
+                                                                   {'route': tuple(lightpath.r), 'sim': simulation + 1, 'time': current_time})
+                                    except Exception:
+                                        pass
+                                    continue
+                            except Exception:
+                                pass
                             net.n[i][j][w] = 0  # lock channel
                             net.t[i][j][w] = alloc_time
                             net.n[j][i][w] = net.n[i][j][w]
@@ -659,7 +684,7 @@ def simulator(args: Namespace) -> None:
             # compute resource utilization (numerator / denominator)
             # denominator = number_of_links * channels * total_simulation_time
             try:
-                # count unique undirected edges returned by net.get_edges()
+                # compute unique undirected edges for denominator
                 n_links_total = 10
                 n_channels = getattr(net, 'nchannels', getattr(net, 'num_ch', None))
                 total_time = float(current_time) if current_time > 0 else 0.0
@@ -693,7 +718,7 @@ def simulator(args: Namespace) -> None:
         print('\n%-7s ' % 'BP (%):', end='')
         print(' '.join(['%4.1f' % b for b in blocks_per_erlang]), end=' ')
         print('[sim %d: %.2f secs]' % (simulation + 1, sim_time))
-        fbase = 'PB_%s_%dch' % (
+        fbase = 'FB_%s_%dch' % (
             args.rwa if args.rwa is not None else '%s_%s' % (args.r, args.w),
             int(args.channels))
 
@@ -712,6 +737,52 @@ def simulator(args: Namespace) -> None:
 
         # Write only the current simulation time on its own line
         write_it_to_disk(args.result_dir, fbase + '.it', [sim_time])
+
+        # Optionally write QKP history log for this simulation to a per-experiment file
+        if getattr(args, 'write_qkp_log', False):
+            try:
+                os.makedirs(args.result_dir, exist_ok=True)
+                qkpf = os.path.join(args.result_dir, fbase + '.qkplog')
+                # prefer public API if present
+                try:
+                    entries = net.get_qkp_log()
+                except Exception:
+                    entries = getattr(net, '_qkp_log', []) or []
+                from datetime import datetime
+                with open(qkpf, 'a', encoding='utf-8') as qf:
+                    qf.write(f"# Simulation {simulation + 1} time={datetime.now().isoformat()} sim_time={sim_time:.6f}\n")
+                    for (edge, amount) in entries:
+                        try:
+                            i, j = edge
+                        except Exception:
+                            # if edge stored differently, stringify tuple
+                            qf.write(f"{edge},{amount}\n")
+                            continue
+                        qf.write(f"{i},{j},{int(amount)}\n")
+                    qf.write('\n')
+                logger.info('Wrote QKP log to %s', qkpf)
+                # Additionally write the QKP consumption usage log (edge, amount, info)
+                try:
+                    usage_entries = net.get_qkp_usage_log()
+                except Exception:
+                    usage_entries = getattr(net, '_qkp_usage_log', []) or []
+                try:
+                    usagef = os.path.join(args.result_dir, fbase + '.qkpusage')
+                    import json
+                    with open(usagef, 'a', encoding='utf-8') as uf:
+                        uf.write(f"# Simulation {simulation + 1} time={datetime.now().isoformat()} sim_time={sim_time:.6f}\n")
+                        for (edge, amount, info) in usage_entries:
+                            try:
+                                i, j = edge
+                                uf.write(f"{i},{j},{int(amount)},{json.dumps(info, ensure_ascii=False)}\n")
+                            except Exception:
+                                uf.write(f"{edge},{int(amount)},{json.dumps(info, ensure_ascii=False)}\n")
+                        uf.write('\n')
+                    logger.info('Wrote QKP usage log to %s', usagef)
+                except Exception:
+                    logger.exception('Failed to write QKP usage log')
+            except Exception:
+                logger.exception('Failed to write QKP log')
 
         # cleanup dij logger handler if it was configured
         if dij_logger_handler is not None:

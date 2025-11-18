@@ -18,6 +18,7 @@ import heapq
 # normal package-relative import (works when running as a module)
 from .io import write_bp_to_disk, write_it_to_disk, write_SP_A_to_disk, write_SP_R_to_disk, plot_bp, plot_sp_a, plot_sp_r
 from .net import Network
+from .net.aux_helpers import map_to_other_aux
 
 
 __all__ = (
@@ -545,10 +546,16 @@ def simulator(args: Namespace) -> None:
                         if lightpath_debug and debug_counter_2 > 0:
                             debug_counter_2 -= 1
                             print('RWA allocated a lightpath containing virtual hops:', lightpath)
-                        if SR > 0.5:
-                            alloc_time = holding_time
-                        else:
+                        if SR <= 0.5:
                             alloc_time = holding_time * 1.5
+                        elif SR > 0.5 and SR < 1.0:
+                            contain_virtual_d1 = map_to_other_aux(net, lightpath)
+                            if contain_virtual_d1:
+                                alloc_time = holding_time * 1.25
+                            else:
+                                alloc_time = holding_time
+                        else:
+                            alloc_time = holding_time
                     else:
                         alloc_time = holding_time
                             

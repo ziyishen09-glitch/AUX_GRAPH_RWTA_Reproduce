@@ -39,7 +39,8 @@ def dijkstra_vertex_coloring(net: Network, k: int, debug: bool = False) -> Union
 
 #temporarily just modified this, because only this is used
 def dijkstra_first_fit(net: Network, s: int, d: int, k: int, debug: bool = False,
-                       aux_graph_mode: bool = False, enable_new_ff: bool = False) -> Union[Lightpath, None]:
+                       aux_graph_mode: bool = False, enable_new_ff: bool = False, 
+                       ) -> Union[Lightpath, None]:
     """Dijkstra and first-fit combination as RWA algorithm
 
     Args:
@@ -97,6 +98,7 @@ def dijkstra_first_fit(net: Network, s: int, d: int, k: int, debug: bool = False
         # fall back to original route
         if len(expanded) == 0:
             return route, contains_virtual_path, mapped_virtual_route
+           
         return expanded, contains_virtual_path, mapped_virtual_route
     
     # default values when not using auxiliary graph expansion
@@ -111,8 +113,13 @@ def dijkstra_first_fit(net: Network, s: int, d: int, k: int, debug: bool = False
     # via enable_new_ff.
     w_list = first_fit(net, route, contains_virtual_path, enable_new_ff=enable_new_ff)
 
-    if w_list is not None and len(w_list) > 0 and all(0 <= w < net.nchannels for w in w_list):
-        lp = Lightpath(route, w_list[0])
+    # Accept w_list even if some links were satisfied via QKP (negative sentinel values)
+    # A valid per-link assignment is one where every entry is either a real wavelength
+    # in [0, nchannels) or a negative sentinel (e.g. -10) meaning QKP-backed link.
+    if w_list is not None and len(w_list) > 0 and all(((w >= 0 and w < net.nchannels) or (isinstance(w, int) and w < 0)) for w in w_list):
+        # Choose a non-negative wavelength as the Lightpath base value if any; else fallback to 0
+        base_w = next((w for w in w_list if isinstance(w, int) and w >= 0), 0)
+        lp = Lightpath(route, base_w)
         try:
             lp.w_list = list(w_list)
         except Exception:
@@ -123,6 +130,12 @@ def dijkstra_first_fit(net: Network, s: int, d: int, k: int, debug: bool = False
         except Exception:
             # backwards compatibility: ignore if properties not supported
             pass
+        # NOTE: QKP recording must be performed only when the simulator
+        # actually allocates the lightpath (and knows the allocated holding
+        # time). The simulator sets `lightpath.holding_time` and calls
+        # `net.t.add_lightpath(lp)` later; therefore QKP bookkeeping is
+        # deferred to the simulator code so the deposited key amount matches
+        # the actual allocated time.
         return lp
     return None
 
@@ -181,9 +194,9 @@ def yen_first_fit(net: Network, k: int, enable_new_ff: bool = False) -> Union[Li
     routes = yen(net.a, net.s, net.d, k)
     for route in routes:
         w_list = first_fit(net, route, enable_new_ff=enable_new_ff)
-        if w_list is not None and len(w_list) > 0 and all(0 <= w < net.nchannels for w in w_list):
-            # keep backward compatibility: set Lightpath.w to first wavelength
-            lp = Lightpath(route, w_list[0])
+        if w_list is not None and len(w_list) > 0 and all(((w >= 0 and w < net.nchannels) or (isinstance(w, int) and w < 0)) for w in w_list):
+            base_w = next((w for w in w_list if isinstance(w, int) and w >= 0), 0)
+            lp = Lightpath(route, base_w)
             try:
                 lp.w_list = list(w_list)
             except Exception:

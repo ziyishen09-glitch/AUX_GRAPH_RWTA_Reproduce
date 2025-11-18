@@ -125,3 +125,35 @@ Fine tune log:
     to use different wavelength accrossing relays -> two kinds of possibility when bypassing: same
     wavelength(as the original one) or different wavelength -> turns out that different wavelength 
     method has closer result to paper.
+
+22. potential bug: don't know how will dijkstra choose the route when weights are same(when bypassing)
+    from test results it chooses ones with less hops (which is expected behavior). Some defensive considering
+    are to be made. By minusing a very small number on the weight of the aux_edge. Correct behavior is guaranteed.
+    (But actually the result is the same). So eventually nothing is modified.
+
+Modification: adding actual fallback layer of auxgraph. Now there are 2 auxgraphs, d1 and aux_graph_d2
+
+23. SR1 is 0.4, SR2 is 0.7. TP2 = 1.5, TP1 = 1.25, TP0 = 1.
+
+24. Added auxgraph_aux_d1 whose threshold is 33.0. added logics in auxgraph_aux_d2 to map d1 to d2, in
+    addition to mapping physical to d2. 
+
+25. Added handler in simulator, if traffic is between 0.4 and 0.7, check whether d2 virtual routes mapped
+    to d1 contains d1 virtual routes. If contains d1 virtual route, that means nodes can be bypassed in d1.
+    If not, that means allocation shall be using TP0.
+
+QKP experiment stage
+
+26. added qkp module to net.py, the container is qkp_pools: Dict[Tuple[int, int], int], the tuple stand for
+    the node pair, i.e. the qkp between two nodes. The int is the number of keys stored in it. the '1'
+    unit here stand for the number of keys that can be produced in one time slot. self._qkp_key_map and _normalize
+    edge helps store the pairs of qkp and the reversed pair, so that any input can be correctly stored into the respective
+    QKP.
+
+27. A number of interfaces have been constructed to manipulate QKPs. add_qkp adds a certain amount of keys
+    into a designated QKP, use_qkp combines checking and consuming process of a designated qkp together. Get_qkp
+    returns the number of keys in one qkp. Record_bypass_saved_keys is used for passive QKP storage. It charges
+    the QKP saved in a bypass process into the respective QKP, and generates a log in the mean time, so that the
+    charging process can be traced. Get_qkp_log returns the qkp charging log constructed by Record_bypass_saved_keys.
+
+28. In the simulator main module, the saved keys in a bypass is stored into the respective QKP.

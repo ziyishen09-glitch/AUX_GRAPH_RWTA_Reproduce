@@ -365,7 +365,7 @@ def simulator(args: Namespace) -> None:
                 lam = float(load_val) / 250.0
                 if lam > 1.0:
                     lam = 1.0
-                return int(np.round(np.random.exponential(scale=1.0 / lam) + 0.25))
+                return int(np.round(np.random.exponential(scale=1.0 / lam) + 0.2))
                 #Alternative rounding variant considered previously:
                 # return int(np.round(np.random.exponential(scale=1.0 / lam) + 0.15))
 

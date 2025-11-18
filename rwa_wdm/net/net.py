@@ -8,7 +8,7 @@ import logging
 from itertools import count
 from operator import itemgetter
 from random import randint
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Dict
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -355,6 +355,32 @@ class Network(object):
                 self._t[i][j][w] = random_time
                 self._t[j][i][w] = self._t[i][j][w]
 
+        # initialize Quantum Key Pools (QKP) for every unordered node pair
+        # Keys are stored as integer counters per undirected edge (i, j) with
+        # i < j. This supports recording keys saved by bypass operations and
+        # querying/consuming keys during routing decisions.
+        self._qkp_pools: Dict[Tuple[int, int], int] = {}
+        for i in range(self._num_nodes):
+            for j in range(i + 1, self._num_nodes):
+                self._qkp_pools[(i, j)] = 0
+
+        # history log of recorded bypass-saved keys (edge, amount)
+        self._qkp_log: List[Tuple[Tuple[int, int], int]] = []
+
+        # history log of QKP consumption events (edge, amount, info)
+        # info is an optional dict describing the request that consumed keys
+        self._qkp_usage_log: List[Tuple[Tuple[int, int], int, dict]] = []
+
+        # precompute a fast lookup map from any ordered node pair (i,j)
+        # to the normalized QKP key (undirected tuple with i <= j). This
+        # avoids repeated normalization computations during runtime.
+        self._qkp_key_map: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        for i in range(self._num_nodes):
+            for j in range(self._num_nodes):
+                if i == j:
+                    continue
+                self._qkp_key_map[(i, j)] = (i, j) if i <= j else (j, i)
+
     # Children are responsible for overriding this method
     def get_edges(self):
         raise NotImplementedError
@@ -408,6 +434,116 @@ class Network(object):
         """The number of links (edges) in the network"""
         return self._num_links
 
+    # --- Quantum Key Pool (QKP) API ---------------------------------
+    def _normalize_edge(self, edge: Tuple[int, int]) -> Tuple[int, int]:
+        """Return the unordered (i, j) tuple used as key for QKP pools.
+
+        Accepts either a 2-tuple (i, j) or a sequence where first two
+        elements are node indices. Normalizes so that i < j.
+        """
+        # Fast-path: if the edge is an ordered pair present in precomputed
+        # map, return it directly. Otherwise coerce and fallback to compute.
+        try:
+            # support sequences (list/tuple) and numeric-like inputs
+            i = int(edge[0])
+            j = int(edge[1])
+        except Exception:
+            raise ValueError('edge must be a pair of node indices')
+
+        key = self._qkp_key_map.get((i, j))
+        if key is not None:
+            return key
+        # fallback (shouldn't happen if map was built for all pairs)
+        return (i, j) if i <= j else (j, i)
+
+    def add_qkp(self, edge: Tuple[int, int], amount: int = 1) -> None:
+        """Add `amount` keys to the QKP pool for `edge` (undirected).
+
+        edge: pair of node indices or sequence with first two elements.
+        """
+        # inline fast lookup using precomputed map to avoid repeated
+        # normalization calls and reduce overhead.
+        try:
+            i = int(edge[0]); j = int(edge[1])
+            key = self._qkp_key_map.get((i, j))
+        except Exception:
+            key = None
+        if key is None:
+            # final fallback to normalized pair
+            key = self._normalize_edge(edge)
+        self._qkp_pools[key] = int(self._qkp_pools.get(key, 0)) + int(amount)
+
+    def use_qkp(self, edge: Tuple[int, int], amount: int = 1) -> bool:
+        """Consume `amount` keys from the pool for `edge` if available.
+
+        Returns True if keys were available and consumed, False otherwise.
+        """
+        try:
+            i = int(edge[0]); j = int(edge[1])
+            key = self._qkp_key_map.get((i, j))
+        except Exception:
+            key = None
+        if key is None:
+            key = self._normalize_edge(edge)
+        avail = int(self._qkp_pools.get(key, 0))
+        if avail >= amount:
+            self._qkp_pools[key] = avail - int(amount)
+            return True
+        return False
+
+    def get_qkp(self, edge: Tuple[int, int]) -> int:
+        """Return the number of keys in the pool for `edge` (undirected)."""
+        try:
+            i = int(edge[0]); j = int(edge[1])
+            key = self._qkp_key_map.get((i, j))
+        except Exception:
+            key = None
+        if key is None:
+            key = self._normalize_edge(edge)
+        return int(self._qkp_pools.get(key, 0))
+
+    def record_bypass_saved_keys(self, edge: Tuple[int, int], amount: int = 1) -> None:
+        """Record keys saved by performing a bypass: increment pool and log it."""
+        try:
+            i = int(edge[0]); j = int(edge[1])
+            key = self._qkp_key_map.get((i, j))
+        except Exception:
+            key = None
+        if key is None:
+            key = self._normalize_edge(edge)
+        self._qkp_pools[key] = int(self._qkp_pools.get(key, 0)) + int(amount)
+        self._qkp_log.append((key, int(amount)))
+
+    @property
+    def qkp_pools(self) -> Dict[Tuple[int, int], int]:
+        """A copy of the all-pairs QKP pools mapping."""
+        return dict(self._qkp_pools)
+
+    def get_qkp_log(self) -> List[Tuple[Tuple[int, int], int]]:
+        """Return a copy of the QKP history log (edge, amount)."""
+        return list(self._qkp_log)
+
+    def record_qkp_consumption(self, edge: Tuple[int, int], amount: int = 1, info: dict | None = None) -> None:
+        """Record an event where keys were consumed from a QKP pool.
+
+        edge: pair of node indices
+        amount: number of keys consumed
+        info: optional dictionary with extra metadata (e.g., route or call id)
+        """
+        try:
+            i = int(edge[0]); j = int(edge[1])
+            key = self._qkp_key_map.get((i, j))
+        except Exception:
+            key = None
+        if key is None:
+            key = self._normalize_edge(edge)
+        self._qkp_usage_log.append((key, int(amount), dict(info or {})))
+
+    def get_qkp_usage_log(self) -> List[Tuple[Tuple[int, int], int, dict]]:
+        """Return a copy of the QKP consumption history log."""
+        return list(self._qkp_usage_log)
+
+
     def plot_topology(self, bestroute: List[int] = None) -> None:
         """Plots the physical topology in a 2D Cartesian plan
 
@@ -460,59 +596,70 @@ class Network(object):
         from matplotlib.path import Path
         from matplotlib.patches import PathPatch
 
-        for idx, aux_edge in enumerate(aux_links):
-            # support edge formats (i,j) or (i,j,weight)
-            if len(aux_edge) == 2:
-                i, j = aux_edge
-                weight = 1
+        # Group auxiliary links by unordered node pair so that multiple
+        # distinct auxiliary paths between the same two nodes are drawn as
+        # parallel curves instead of overlapping each other.
+        from collections import defaultdict
+        aux_list = list(aux_links)
+        groups = defaultdict(list)
+        for (entry) in aux_list:
+            if len(entry) == 2:
+                u, v = entry
+                w = 1
             else:
-                i, j = aux_edge[0], aux_edge[1]
-                # third element is treated as weight (numeric)
-                try:
-                    weight = float(aux_edge[2])
-                except Exception:
-                    weight = 1
+                u, v, w = entry[0], entry[1], entry[2]
+            key = (u, v) if u <= v else (v, u)
+            groups[key].append((u, v, w))
 
-            x0, y0 = node_coords[i][0], node_coords[i][1]
-            x1, y1 = node_coords[j][0], node_coords[j][1]
+        # draw each group's entries with slightly offset curvature
+        for key, entries in groups.items():
+            u, v = key
+            x0, y0 = node_coords[u][0], node_coords[u][1]
+            x1, y1 = node_coords[v][0], node_coords[v][1]
 
-            # compute a perpendicular offset for the control point
             dx = x1 - x0
             dy = y1 - y0
-            # normalized perpendicular vector
             perp_x, perp_y = -dy, dx
             norm = (perp_x ** 2 + perp_y ** 2) ** 0.5
             if norm != 0:
                 perp_x /= norm
                 perp_y /= norm
 
-            # alternating curve direction based on index to avoid overlap
-            direction = 1 if (idx % 2 == 0) else -1
-
-            # curvature amplitude: scale with node distance
             dist = ((dx ** 2) + (dy ** 2)) ** 0.5
-            amp = max(0.15 * dist, 0.2)
+            base_amp = max(0.15 * dist, 0.2)
 
-            # control point for quadratic Bezier (midpoint displaced by perp)
-            cx = (x0 + x1) / 2.0 + direction * perp_x * amp
-            cy = (y0 + y1) / 2.0 + direction * perp_y * amp
+            # multiple entries: space them symmetrically around center
+            m = len(entries)
+            for k, (orig_u, orig_v, weight) in enumerate(entries):
+                # center the offsets: indices -> -floor((m-1)/2) ... +ceil((m-1)/2)
+                offset_index = k - (m - 1) / 2.0
+                # scale amplitude so larger offsets are more curved
+                amp = base_amp * (1.0 + 0.3 * abs(offset_index))
+                # direction sign from offset_index
+                direction = 1 if offset_index >= 0 else -1
 
-            # construct a quadratic Bezier path (CURVE3 segments)
-            verts = [(x0, y0), (cx, cy), (x1, y1)]
-            codes = [Path.MOVETO, Path.CURVE3, Path.CURVE3]
-            path = Path(verts, codes)
-            patch = PathPatch(path, facecolor='none', edgecolor='blue', lw=2)
-            ax.add_patch(patch)
+                cx = (x0 + x1) / 2.0 + direction * perp_x * amp
+                cy = (y0 + y1) / 2.0 + direction * perp_y * amp
 
-            # annotate weight at curve midpoint (use param t=0.5 on quadratic bezier)
-            try:
-                # quadratic Bezier midpoint formula for t=0.5
-                t = 0.5
-                mx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
-                my = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
-                ax.annotate(str(int(weight)) if weight == int(weight) else str(weight), xy=(mx, my), xytext=(0, 0), textcoords='offset points', ha='center', va='center', fontsize=12, color='green')
-            except Exception:
-                pass
+                verts = [(x0, y0), (cx, cy), (x1, y1)]
+                codes = [Path.MOVETO, Path.CURVE3, Path.CURVE3]
+                path = Path(verts, codes)
+                patch = PathPatch(path, facecolor='none', edgecolor='blue', lw=2)
+                ax.add_patch(patch)
+
+                # annotate weight at curve midpoint (t=0.5)
+                try:
+                    t = 0.5
+                    mx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
+                    my = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
+                    # weight label rounding as earlier
+                    try:
+                        wlabel = str(int(round(weight)))
+                    except Exception:
+                        wlabel = str(weight)
+                    ax.annotate(wlabel, xy=(mx, my), xytext=(0, 0), textcoords='offset points', ha='center', va='center', fontsize=12, color='green')
+                except Exception:
+                    pass
         # highlight in red the shortest path with wavelength(s) available
         # a.k.a. 'best route'
         if bestroute is not None:

@@ -2,11 +2,9 @@ from typing import Dict, List, Tuple
 from collections import OrderedDict
 from . import Network
 from ..rwa.routing.dijkstra import dijkstra
-# import the aux d1 class from the same package and the AdjacencyMatrix type
-from .auxgraph_aux_d1 import auxgraph_aux_d1 as aux_d1_class
-from .net import AdjacencyMatrix
 
-class auxgraph_aux_d2(Network):
+
+class auxgraph_aux_d1(Network):
     """A network subclass that can build an auxiliary graph.
     The auxiliary graph connects pairs of nodes (u,v) when the shortest
     physical-path distance between them is below a provided threshold.
@@ -14,8 +12,8 @@ class auxgraph_aux_d2(Network):
     """
 
     def __init__(self, ch_n: int):
-        self._name = 'auxgraph_aux_d2'
-        self._fullname = 'auxgraph_aux_d2'
+        self._name = 'auxgraph_aux_d1'
+        self._fullname = 'auxgraph_aux_d1'
         self._s = 0
         self._d = 1
         super().__init__(ch_n,
@@ -25,13 +23,8 @@ class auxgraph_aux_d2(Network):
         # containers populated by build_auxiliary_graph
         self._aux_edges: List[Tuple[int, int, float]] = []
         # map (s,d) -> physical path (list of node indices)
-        self._aux_paths_physical: Dict[Tuple[int, int], List[int]] = {}
-        self._aux_paths_d1: Dict[Tuple[int, int], List[int]] = {}
-        self._a_d1 = AdjacencyMatrix(self._num_nodes)
-        # build physical-based auxiliary edges + path mapping
-        self._aux_edges, self._aux_paths_physical = self.build_auxiliary_graph_phys(threshold=39.0)
-        # build mapping from this d2 virtual adjacency into the d1 auxiliary graph
-        self._aux_paths_d1 = self.build_auxiliary_graph_d1(threshold=39.0)
+        self._aux_paths: Dict[Tuple[int, int], List[int]] = {}
+        self._aux_edges, self._aux_paths = self.build_auxiliary_graph(threshold=33.0)
         # self._aux_path shall be constructed over a lower grade
         # aux_graph like auxgraph_aux_d1 if the experiment needs 
         # to be expanded, and aux_path may look like this:
@@ -112,21 +105,7 @@ class auxgraph_aux_d2(Network):
             total += w
         return total
 
-    def _path_length_on(self, path: List[int], adj) -> float:
-        """Return total length of path using provided adjacency matrix-like object."""
-        if not path or len(path) < 2:
-            return 0.0
-        total = 0.0
-        for i in range(len(path) - 1):
-            u, v = path[i], path[i + 1]
-            try:
-                total += float(adj[u][v])
-            except Exception:
-                # ignore missing entries
-                pass
-        return total
-
-    def build_auxiliary_graph_phys(self, threshold: float) -> Tuple[List[Tuple[int, int, float]], Dict[Tuple[int, int], List[int]]]:
+    def build_auxiliary_graph(self, threshold: float) -> Tuple[List[Tuple[int, int, float]], Dict[Tuple[int, int], List[int]]]:
         """Construct auxiliary edges for all node pairs whose shortest-path
         distance is <= threshold.
 
@@ -135,7 +114,7 @@ class auxgraph_aux_d2(Network):
             aux_paths: dict mapping (s, d) -> physical path (list of node indices)
         """
         self._aux_edges = []
-        self._aux_paths_physical = {}
+        self._aux_paths = {}
         n = self._num_nodes
 
         # Try to import the project dijkstra at runtime; if that fails,
@@ -145,7 +124,6 @@ class auxgraph_aux_d2(Network):
             for d in range(n):
                 if d == s:
                     continue
-                # force concrete list in case dijkstra returns an iterator
                 path = list(dijkstra(self._a, s, d, debug=False))
                 if not path:
                     continue
@@ -160,85 +138,12 @@ class auxgraph_aux_d2(Network):
                     # already a physical neighbour, so not an auxiliary link
                     continue
 
-                # compute distance using this class' adjacency matrix
                 dist = self._path_length(path)
-
                 if dist <= threshold:
-                    p_copy = list(path)
-                    # add forward mapping if missing
-                    if (s, d) not in self._aux_paths_physical:
-                        self._aux_edges.append((s, d, dist))
-                        self._aux_paths_physical[(s, d)] = p_copy
-                    # add reverse mapping
-                    if (d, s) not in self._aux_paths_physical:
-                        self._aux_edges.append((d, s, dist))
-                        self._aux_paths_physical[(d, s)] = list(reversed(p_copy))
+                    self._aux_edges.append((s, d, dist))
+                    self._aux_paths[(s, d)] = path
 
-        return self._aux_edges, self._aux_paths_physical
+        return self._aux_edges, self._aux_paths
     
     def virtual_adjacency2physical_path(self):
-        return self._aux_paths_physical
-    
-    def build_auxiliary_graph_d1(self, threshold: float) -> Tuple[List[Tuple[int, int, float]], Dict[Tuple[int, int], List[int]]]:
-        """Construct auxiliary edges for all node pairs whose shortest-path
-        distance is <= threshold.
-
-        Returns:
-            aux_edges: list of tuples (s, d, distance)
-            aux_paths: dict mapping (s, d) -> physical path (list of node indices)
-        """
-        # build adjacency for the d1 graph by instantiating the d1 class
-        self._aux_paths_d1 = {}
-        n = self._num_nodes
-
-        # instantiate an aux_d1 instance to obtain its edge list
-        try:
-            aux1 = aux_d1_class(self._num_channels)
-        except Exception:
-            # fallback: try constructing with same signature as this class
-            aux1 = aux_d1_class(self._num_channels)
-
-        # fill the local a_d1 adjacency using aux1 edges
-        for edge in aux1.get_all_edges():
-            if len(edge) == 2:
-                i, j = edge
-                neigh = 1
-            else:
-                i, j, neigh = edge
-            try:
-                self._a_d1[i][j] = neigh
-            except Exception:
-                self._a_d1[i][j] = 1
-            self._a_d1[j][i] = self._a_d1[i][j]
-
-        # compute shortest paths over the d1 adjacency and map d2 virtual
-        # adjacency to corresponding d1 paths when distance <= threshold
-        for s in range(n):
-            for d in range(n):
-                if d == s:
-                    continue
-                path = list(dijkstra(self._a_d1, s, d, debug=False))
-                if not path:
-                    continue
-
-                try:
-                    direct = float(self._a_d1[s][d])
-                except Exception:
-                    direct = 0.0
-                if direct > 0:
-                    continue
-
-                # compute distance using the d1 adjacency
-                dist = self._path_length_on(path, self._a_d1)
-
-                if dist <= threshold:
-                    p_copy = list(path)
-                    if (s, d) not in self._aux_paths_d1:
-                        self._aux_paths_d1[(s, d)] = p_copy
-                    if (d, s) not in self._aux_paths_d1:
-                        self._aux_paths_d1[(d, s)] = list(reversed(p_copy))
-
-        return self._aux_paths_d1
-
-    def virtual_adjacency2d1_path(self):
-        return self._aux_paths_d1
+        return self._aux_paths
